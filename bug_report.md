@@ -52,19 +52,41 @@ Token validation now checks `payload["jti"]`, matching the value recorded during
 
 ## Bug 3 — Refresh Tokens Can Be Reused
 
-**File:** `app/routers/auth.py`
+**File:** `app/routers/auth.py`, `app/models.py`
 
 ### Symptom
 
-The same refresh token could be submitted to `POST /auth/refresh` multiple times, returning new access and refresh tokens each time.
+The same refresh token could be submitted to `POST /auth/refresh` multiple times, returning new access and refresh tokens each time. A simple in-memory set fixed sequential reuse, but still left two important gaps: simultaneous refresh requests could race, and used-token state disappeared after an app restart.
 
 ### Bug
 
-The refresh endpoint decoded and accepted valid refresh tokens but never marked a refresh token as consumed.
+The refresh endpoint decoded and accepted valid refresh tokens but originally never marked a refresh token as consumed. The first fix recorded used token `jti` values in an in-memory set, but that was still not durable and not guarded by an atomic database constraint.
 
 ### Fix
 
-The endpoint now records used refresh-token `jti` values and rejects reuse with `401 UNAUTHORIZED`.
+Used refresh-token `jti` values are now stored in a database table with a unique constraint:
+
+```python
+class UsedRefreshToken(Base):
+    __tablename__ = "used_refresh_tokens"
+
+    id = Column(Integer, primary_key=True)
+    jti = Column(String, nullable=False, unique=True, index=True)
+    used_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+```
+
+`POST /auth/refresh` inserts the presented refresh token's `jti` before issuing replacement tokens. If the insert hits the unique constraint, the token has already been used and the request returns `401 UNAUTHORIZED`:
+
+```python
+db.add(UsedRefreshToken(jti=data["jti"]))
+try:
+    db.commit()
+except IntegrityError:
+    db.rollback()
+    raise AppError(401, "UNAUTHORIZED", "Refresh token has already been used")
+```
+
+This makes refresh-token reuse rejection durable across restarts and atomic under concurrent requests.
 
 ---
 
@@ -822,17 +844,13 @@ return _serialize_room(room)
 
 ---
 
-## Bug 26 — Room Stats Counters Were Not Concurrency-Safe
+## Bug 26 — Room Stats Could Drift From Confirmed Bookings
 
-**File:** `app/services/stats.py` (lines 10, 18, 26)
+**File:** `app/services/stats.py`, `app/routers/rooms.py`
 
 ### Symptom
 
-`GET /rooms/{id}/stats` must always equal the values derivable from the bookings,
-including after bursts of concurrent activity (§14). `record_create` and
-`record_cancel` performed a non-atomic read-modify-write (read counters → pause →
-write), so concurrent bookings for the same room lost updates and the count and
-revenue drifted below their true values.
+`GET /rooms/{id}/stats` must always equal the values derivable from confirmed bookings, including after bursts of concurrent activity (§14). The endpoint depended on in-memory counters, so stats could drift from the database after concurrent activity, after app restart with an existing SQLite database, or during the short gap after a booking commit but before the in-memory counter update completed.
 
 ### Bug
 
@@ -844,18 +862,18 @@ def record_create(room_id: int, price_cents: int) -> None:
     _stats[room_id] = {"count": count + 1, "revenue": revenue + price_cents}
 ```
 
+Even with a lock around the counter updates, the data was still not the source of truth: `_stats` reset on process restart while bookings remained in SQLite.
+
 ### Fix
 
-Serialize the read-modify-write with a module-level lock (applied to both
-`record_create` and `record_cancel`):
+The stats endpoint now derives the values directly from the `bookings` table, filtering only confirmed bookings for the requested room:
 
 ```python
-_lock = threading.Lock()
-
-def record_create(room_id: int, price_cents: int) -> None:
-    with _lock:
-        current = _stats.get(room_id, {"count": 0, "revenue": 0})
-        count, revenue = current["count"], current["revenue"]
-        _aggregate_pause()
-        _stats[room_id] = {"count": count + 1, "revenue": revenue + price_cents}
+count, revenue = (
+    db.query(func.count(Booking.id), func.coalesce(func.sum(Booking.price_cents), 0))
+    .filter(Booking.room_id == room.id, Booking.status == "confirmed")
+    .one()
+)
 ```
+
+The response now comes from SQLite, so it remains consistent with the actual confirmed bookings after restarts and concurrent booking/cancellation activity.

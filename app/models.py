@@ -67,3 +67,11 @@ class RefundLog(Base):
     amount_cents = Column(Integer, nullable=False)
     status = Column(String, nullable=False)
     processed_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+class UsedRefreshToken(Base):
+    __tablename__ = "used_refresh_tokens"
+
+    id = Column(Integer, primary_key=True)
+    jti = Column(String, nullable=False, unique=True, index=True)
+    used_at = Column(DateTime, default=datetime.utcnow, nullable=False)

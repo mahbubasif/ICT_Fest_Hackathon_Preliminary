@@ -1,5 +1,6 @@
 """Authentication endpoints: register, login, refresh, logout."""
 from fastapi import APIRouter, Depends
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from ..auth import (
@@ -13,12 +14,10 @@ from ..auth import (
 )
 from ..database import get_db
 from ..errors import AppError
-from ..models import Organization, User
+from ..models import Organization, UsedRefreshToken, User
 from ..schemas import LoginRequest, RefreshRequest, RegisterRequest
 
 router = APIRouter(prefix="/auth", tags=["auth"])
-
-_used_refresh_tokens: set[str] = set()
 
 
 @router.post("/register", status_code=201)
@@ -80,9 +79,13 @@ def refresh(payload: RefreshRequest, db: Session = Depends(get_db)):
     data = decode_token(payload.refresh_token)
     if data.get("type") != "refresh":
         raise AppError(401, "UNAUTHORIZED", "Wrong token type")
-    if data["jti"] in _used_refresh_tokens:
+    db.add(UsedRefreshToken(jti=data["jti"]))
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
         raise AppError(401, "UNAUTHORIZED", "Refresh token has already been used")
-    _used_refresh_tokens.add(data["jti"])
+
     user = db.query(User).filter(User.id == int(data["sub"])).first()
     if user is None:
         raise AppError(401, "UNAUTHORIZED", "Unknown user")
