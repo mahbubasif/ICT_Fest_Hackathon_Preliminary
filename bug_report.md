@@ -263,3 +263,140 @@ response["refunds"] = [ ... ]
 response = serialize_booking(booking)
 response["refunds"] = [ ... ]
 ```
+
+---
+
+## Bug 11 — Creating a Booking Left the Usage-Report Cache Stale
+
+**Difficulty:** Medium  
+**File:** `app/routers/bookings.py` (line 122, `create_booking`)
+
+### Symptom
+
+`GET /admin/usage-report` caches results per `(org, from, to)`. `create_booking`
+invalidated the availability cache but **not** the report cache, so a usage
+report pulled before a new booking kept returning stale (pre-booking) counts and
+revenue. Rule §12 requires the report to reflect the current state immediately.
+
+### Bug
+
+```python
+stats.record_create(room.id, price_cents)
+cache.invalidate_availability(room.id, start.date().isoformat())
+notifications.notify_created(booking)
+```
+
+### Fix
+
+```python
+stats.record_create(room.id, price_cents)
+cache.invalidate_availability(room.id, start.date().isoformat())
+cache.invalidate_report(user.org_id)
+notifications.notify_created(booking)
+```
+
+---
+
+## Bug 12 — Cancelling a Booking Left the Availability Cache Stale
+
+**Difficulty:** Medium  
+**File:** `app/routers/bookings.py` (line 220, `cancel_booking`)
+
+### Symptom
+
+`GET /rooms/{id}/availability` caches busy intervals per `(room, date)`.
+`cancel_booking` invalidated the report cache but **not** the availability cache,
+so after a cancellation the room's availability kept showing the cancelled
+booking as a busy interval. Rule §13 requires availability to reflect the current
+state immediately.
+
+### Bug
+
+```python
+stats.record_cancel(booking.room_id, booking.price_cents)
+cache.invalidate_report(user.org_id)
+notifications.notify_cancelled(booking)
+```
+
+### Fix
+
+```python
+stats.record_cancel(booking.room_id, booking.price_cents)
+cache.invalidate_report(user.org_id)
+cache.invalidate_availability(booking.room_id, booking.start_time.date().isoformat())
+notifications.notify_cancelled(booking)
+```
+
+---
+
+## Bug 13 — Creating a Room Left the Usage-Report Cache Stale
+
+**Difficulty:** Medium  
+**File:** `app/routers/rooms.py` (line 57, `create_room`)
+
+### Symptom
+
+The usage report must list every room in the org, "including rooms with zero
+bookings" (§12). A report cached before a new room was created omitted that room
+until some other activity happened to invalidate the cache, because `create_room`
+did not invalidate the report cache.
+
+### Bug
+
+```python
+db.add(room)
+db.commit()
+db.refresh(room)
+return _serialize_room(room)
+```
+
+### Fix
+
+```python
+db.add(room)
+db.commit()
+db.refresh(room)
+cache.invalidate_report(admin.org_id)
+return _serialize_room(room)
+```
+
+---
+
+## Bug 14 — Room Stats Counters Were Not Concurrency-Safe
+
+**Difficulty:** Hard  
+**File:** `app/services/stats.py` (lines 10, 18, 26)
+
+### Symptom
+
+`GET /rooms/{id}/stats` must always equal the values derivable from the bookings,
+including after bursts of concurrent activity (§14). `record_create` and
+`record_cancel` performed a non-atomic read-modify-write (read counters → pause →
+write), so concurrent bookings for the same room lost updates and the count and
+revenue drifted below their true values.
+
+### Bug
+
+```python
+def record_create(room_id: int, price_cents: int) -> None:
+    current = _stats.get(room_id, {"count": 0, "revenue": 0})
+    count, revenue = current["count"], current["revenue"]
+    _aggregate_pause()
+    _stats[room_id] = {"count": count + 1, "revenue": revenue + price_cents}
+```
+
+### Fix
+
+Serialize the read-modify-write with a module-level lock (applied to both
+`record_create` and `record_cancel`):
+
+```python
+_lock = threading.Lock()
+
+def record_create(room_id: int, price_cents: int) -> None:
+    with _lock:
+        current = _stats.get(room_id, {"count": 0, "revenue": 0})
+        count, revenue = current["count"], current["revenue"]
+        _aggregate_pause()
+        _stats[room_id] = {"count": count + 1, "revenue": revenue + price_cents}
+```
