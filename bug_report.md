@@ -116,3 +116,150 @@ Offset-aware datetimes are now converted to UTC first, then stored as naive UTC:
 ```python
 dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
 ```
+
+---
+
+## Bug 6 — `GET /bookings` Sorted Newest-First Instead of Oldest-First
+
+**Difficulty:** Easy  
+**File:** `app/routers/bookings.py` (line 137, `list_bookings`)
+
+### Symptom
+
+`GET /bookings` returned the caller's bookings sorted by **descending** `start_time`.
+The contract requires **ascending** `start_time` (earliest first), ties broken by
+ascending `id`. Because pagination slices this ordering, page contents were wrong
+too — page 1 returned the most recent bookings instead of the earliest.
+
+### Bug
+
+```python
+base.order_by(Booking.start_time.desc(), Booking.id.asc())
+```
+
+### Fix
+
+```python
+base.order_by(Booking.start_time.asc(), Booking.id.asc())
+```
+
+---
+
+## Bug 7 — `GET /bookings` Pagination Skipped the First Page
+
+**Difficulty:** Medium  
+**File:** `app/routers/bookings.py` (line 138, `list_bookings`)
+
+### Symptom
+
+Page N with limit L must return items `[(N−1)·L, N·L)`. The offset used
+`page * limit`, skipping one full page: page 1 skipped the first `limit`
+bookings, so a user with exactly `limit` bookings received an **empty** page 1
+even though `total` was non-zero. Every page returned the next page's contents.
+
+### Bug
+
+```python
+.offset(page * limit)
+```
+
+### Fix
+
+```python
+.offset((page - 1) * limit)
+```
+
+---
+
+## Bug 8 — `GET /bookings` Ignored the Requested `limit`
+
+**Difficulty:** Easy  
+**File:** `app/routers/bookings.py` (line 139, `list_bookings`)
+
+### Symptom
+
+The endpoint validated and echoed a `limit` (1–100) and used it to compute the
+offset, but hardcoded the page size to 10 rows. With `limit > 10`, bookings
+between index 10 and `limit` were returned by no page (skips); with `limit < 10`,
+consecutive pages overlapped (repeats) — both violating "sequential pages never
+skip or repeat items."
+
+### Bug
+
+```python
+.offset((page - 1) * limit)
+.limit(10)
+```
+
+### Fix
+
+```python
+.offset((page - 1) * limit)
+.limit(limit)
+```
+
+---
+
+## Bug 9 — Members Could Read Other Members' Bookings
+
+**Difficulty:** Medium  
+**File:** `app/routers/bookings.py` (lines 164–165, `get_booking`)
+
+### Symptom
+
+`GET /bookings/{id}` scoped the lookup by organization but not by ownership, so
+any member could read another member's booking in the same org. Booking ids are
+sequential, making every booking enumerable. The contract requires another
+member's booking id to return `404 BOOKING_NOT_FOUND`; only admins may read any
+booking in their org. (`cancel_booking` already enforced this; the read path did
+not.)
+
+### Bug
+
+```python
+if booking is None:
+    raise AppError(404, "BOOKING_NOT_FOUND", "Booking not found")
+
+response = serialize_booking(booking)
+```
+
+### Fix
+
+```python
+if booking is None:
+    raise AppError(404, "BOOKING_NOT_FOUND", "Booking not found")
+if user.role != "admin" and booking.user_id != user.id:
+    raise AppError(404, "BOOKING_NOT_FOUND", "Booking not found")
+
+response = serialize_booking(booking)
+```
+
+---
+
+## Bug 10 — `GET /bookings/{id}` Returned `created_at` as `start_time`
+
+**Difficulty:** Easy  
+**File:** `app/routers/bookings.py` (`get_booking`)
+
+### Symptom
+
+The single-booking detail endpoint overwrote the correctly-serialized
+`start_time` with the booking's `created_at`, so the response reported the
+record-creation time instead of the reserved slot's start. This also disagreed
+with the `start_time` returned by `POST /bookings` and `GET /bookings` (list) for
+the same booking.
+
+### Bug
+
+```python
+response = serialize_booking(booking)
+response["start_time"] = iso_utc(booking.created_at)   # clobbers the real start_time
+response["refunds"] = [ ... ]
+```
+
+### Fix
+
+```python
+response = serialize_booking(booking)
+response["refunds"] = [ ... ]
+```
