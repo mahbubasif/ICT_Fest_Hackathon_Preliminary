@@ -1,4 +1,4 @@
-"""Authentication: password hashing, JWT issue/verify, request dependencies."""
+"""Authentication: password hashing, JWT issue/verify, request dependencies. """
 import hashlib
 import hmac
 import os
